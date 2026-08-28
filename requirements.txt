@@ -2,3 +2,4 @@ streamlit
 osmnx
 networkx
 folium
+scikit-learn
