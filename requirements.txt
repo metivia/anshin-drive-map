@@ -1,4 +1,4 @@
-streamit
+streamlit
 osmnx
 networkx
 folium
