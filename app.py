@@ -1,764 +1,500 @@
+
 import streamlit as st
-
 import osmnx as ox
-
 import networkx as nx
-
 import folium
-
-import streamlit.components.v1 as components
+import json
+from streamlit.components.v1 import html
 
 # ==========================================
-
 # ページ設定
-
 # ==========================================
 
 st.set_page_config(
-
     page_title="安心ドライブMAP",
-
     page_icon="🚗",
-
     layout="wide"
-
 )
 
 st.title("🚗 安心ドライブMAP")
 
 st.write(
-
-    "道路の特徴から算出した安心度をもとに、"
-
-    "「最短ルート」と「安心ルート」を比較できます。"
-
+    "最短距離だけでなく、道路の特徴から算出した安心度を考慮して、"
+    "できるだけ運転しやすいルートを提案します。"
 )
 
 # ==========================================
-
-# 道路ネットワークを読み込む
-
+# グラフ読み込み
 # ==========================================
 
 @st.cache_resource
-
 def load_graph():
 
-    G = ox.load_graphml("anshin_drive_graph.graphml")
+    G = ox.load_graphml(
+        "/content/drive/MyDrive/anshin_drive_graph.graphml"
+    )
 
-    # GraphMLから読み込むと数値が文字列になる場合があるため変換
-
+    # GraphML保存後に文字列になった数値をfloatへ戻す
     for u, v, k, data in G.edges(keys=True, data=True):
 
-        try:
-
-            length = float(data.get("length", 1))
-
-        except (TypeError, ValueError):
-
-            length = 1.0
-
+        length = float(data.get("length", 1))
         data["length"] = length
 
         try:
-
             data["safety_cost"] = float(data["safety_cost"])
-
         except (KeyError, TypeError, ValueError):
-
-            # 安心度情報がない道路は少し高めのコスト
-
             data["safety_cost"] = length * 2.5
 
     return G
 
+
 G = load_graph()
 
 # ==========================================
-
 # 選択できる地点
-
 # ==========================================
 
 places = {
-
     "八王子駅": (35.6556, 139.3389),
-
     "西八王子駅": (35.6566, 139.3126),
-
     "八王子市役所": (35.6663, 139.3160),
-
 }
 
 # ==========================================
-
-# 入力
-
+# 出発地・目的地
 # ==========================================
 
 col1, col2 = st.columns(2)
 
 with col1:
-
     start_name = st.selectbox(
-
-        "🚩 出発地",
-
+        "📍 出発地",
         list(places.keys()),
-
         index=0
-
     )
 
 with col2:
-
     goal_name = st.selectbox(
-
         "🏁 目的地",
-
         list(places.keys()),
-
         index=2
-
     )
 
-route_type = st.radio(
-
-    "ルートを選んでください",
-
-    ["🟢 安心ルート", "🔵 最短ルート"],
-
-    horizontal=True
-
-)
-
-# ==========================================
-
-# 同じ地点が選ばれた場合
-
-# ==========================================
-
 if start_name == goal_name:
-
     st.warning("出発地と目的地は別の場所を選んでください。")
-
     st.stop()
 
-# ==========================================
-
-# 出発地・目的地の最寄りノード
-
-# ==========================================
-
 start_lat, start_lon = places[start_name]
-
 goal_lat, goal_lon = places[goal_name]
 
+# ==========================================
+# 最寄りノード
+# ==========================================
+
 start_node = ox.distance.nearest_nodes(
-
     G,
-
     X=start_lon,
-
     Y=start_lat
-
 )
 
 goal_node = ox.distance.nearest_nodes(
-
     G,
-
     X=goal_lon,
-
     Y=goal_lat
-
 )
 
 # ==========================================
+# ルート選択
+# ==========================================
 
+route_type = st.radio(
+    "ルートを選んでください",
+    ["🔵 最短ルート", "🟢 安心ルート"],
+    horizontal=True
+)
+
+# ==========================================
 # ルート計算
-
 # ==========================================
 
 try:
 
-    if route_type == "🟢 安心ルート":
+    if route_type == "🔵 最短ルート":
 
         route = nx.shortest_path(
-
             G,
-
             start_node,
-
             goal_node,
-
-            weight="safety_cost"
-
-        )
-
-        route_color = "green"
-
-    else:
-
-        route = nx.shortest_path(
-
-            G,
-
-            start_node,
-
-            goal_node,
-
             weight="length"
-
         )
 
         route_color = "blue"
 
+    else:
+
+        route = nx.shortest_path(
+            G,
+            start_node,
+            goal_node,
+            weight="safety_cost"
+        )
+
+        route_color = "green"
+
 except nx.NetworkXNoPath:
 
-    st.error("この地点間のルートが見つかりませんでした。")
-
+    st.error("この地点間ではルートを見つけられませんでした。")
     st.stop()
 
 # ==========================================
-
-# ルートの道路情報を取得
-
+# ルート評価
 # ==========================================
 
-route_edges = []
+score_map = {
+    "安心寄り": 100,
+    "注意": 50,
+    "避けたい": 0,
+    "不明": 25
+}
+
+total_distance = 0
+score_sum = 0
+
+safety_distance = {
+    "安心寄り": 0,
+    "注意": 0,
+    "避けたい": 0,
+    "不明": 0
+}
 
 for u, v in zip(route[:-1], route[1:]):
 
-    edge_dict = G.get_edge_data(u, v)
+    edge_data = G.get_edge_data(u, v)
 
-    if edge_dict is None:
-
+    if edge_data is None:
         continue
 
-    # 複数の道路がある場合は最短のものを使用
-
-    key = min(
-
-        edge_dict,
-
-        key=lambda k: float(
-
-            edge_dict[k].get("length", 1)
-
-        )
-
-    )
-
-    data = edge_dict[key]
-
-    try:
-
-        length = float(data.get("length", 0))
-
-    except (TypeError, ValueError):
-
-        length = 0
-
-    safety_level = str(
-
-        data.get("safety_level", "不明")
-
-    )
-
-    route_edges.append(
-
-        {
-
-            "length": length,
-
-            "safety_level": safety_level
-
-        }
-
-    )
-
-# ==========================================
-
-# 距離
-
-# ==========================================
-
-total_distance = sum(
-
-    edge["length"]
-
-    for edge in route_edges
-
-)
-
-# ==========================================
-
-# 安心ドライブスコア
-
-# ==========================================
-
-score_table = {
-
-    "安心寄り": 100,
-
-    "注意": 50,
-
-    "避けたい": 0,
-
-    "不明": 25
-
-}
-
-if total_distance > 0:
-
-    safety_score = sum(
-
-        edge["length"]
-
-        * score_table.get(
-
-            edge["safety_level"],
-
-            25
-
-        )
-
-        for edge in route_edges
-
-    ) / total_distance
-
-else:
-
-    safety_score = 0
-
-# ==========================================
-
-# 安心度評価率
-
-# ==========================================
-
-known_distance = sum(
-
-    edge["length"]
-
-    for edge in route_edges
-
-    if edge["safety_level"] != "不明"
-
-)
-
-if total_distance > 0:
-
-    coverage = (
-
-        known_distance
-
-        / total_distance
-
-        * 100
-
-    )
-
-else:
-
-    coverage = 0
-
-# ==========================================
-
-# 安心度別割合
-
-# ==========================================
-
-levels = [
-
-    "安心寄り",
-
-    "注意",
-
-    "避けたい",
-
-    "不明"
-
-]
-
-level_percentages = {}
-
-for level in levels:
-
-    level_distance = sum(
-
-        edge["length"]
-
-        for edge in route_edges
-
-        if edge["safety_level"] == level
-
-    )
-
-    if total_distance > 0:
-
-        percentage = (
-
-            level_distance
-
-            / total_distance
-
-            * 100
-
+    if route_type == "🔵 最短ルート":
+
+        data = min(
+            edge_data.values(),
+            key=lambda d: float(
+                d.get("length", float("inf"))
+            )
         )
 
     else:
 
-        percentage = 0
+        data = min(
+            edge_data.values(),
+            key=lambda d: float(
+                d.get("safety_cost", float("inf"))
+            )
+        )
 
-    level_percentages[level] = percentage
+    length = float(data.get("length", 0))
+    level = data.get("safety_level", "不明")
+
+    if level not in score_map:
+        level = "不明"
+
+    total_distance += length
+    safety_distance[level] += length
+    score_sum += score_map[level] * length
+
+# 安心ドライブスコア
+if total_distance > 0:
+    route_score = score_sum / total_distance
+else:
+    route_score = 0
+
+# 評価できた道路の割合
+known_distance = (
+    safety_distance["安心寄り"]
+    + safety_distance["注意"]
+    + safety_distance["避けたい"]
+)
+
+if total_distance > 0:
+    coverage = known_distance / total_distance * 100
+else:
+    coverage = 0
 
 # ==========================================
-
 # 結果表示
-
 # ==========================================
 
-st.subheader("📊 ルート結果")
+st.subheader(
+    f"{start_name} → {goal_name}"
+)
 
-m1, m2, m3 = st.columns(3)
+metric1, metric2, metric3 = st.columns(3)
 
-with m1:
+with metric1:
 
     st.metric(
-
-        "走行距離",
-
+        "ルート距離",
         f"{total_distance / 1000:.2f} km"
-
     )
 
-with m2:
+with metric2:
 
     st.metric(
-
         "安心ドライブスコア",
-
-        f"{safety_score:.1f} / 100"
-
+        f"{route_score:.1f} / 100"
     )
 
-with m3:
+with metric3:
 
     st.metric(
-
         "安心度評価率",
-
         f"{coverage:.1f}%"
-
-    )
-
-st.write("### 🛣️ 道路の安心度")
-
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-
-    st.metric(
-
-        "🟢 安心寄り",
-
-        f"{level_percentages['安心寄り']:.1f}%"
-
-    )
-
-with c2:
-
-    st.metric(
-
-        "🟡 注意",
-
-        f"{level_percentages['注意']:.1f}%"
-
-    )
-
-with c3:
-
-    st.metric(
-
-        "🔴 避けたい",
-
-        f"{level_percentages['避けたい']:.1f}%"
-
-    )
-
-with c4:
-
-    st.metric(
-
-        "⚪ 不明",
-
-        f"{level_percentages['不明']:.1f}%"
-
     )
 
 # ==========================================
-
-# 地図作成
-
+# 道路構成
 # ==========================================
+
+if total_distance > 0:
+
+    st.write("### 道路の安心度")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.metric(
+            "🟢 安心寄り",
+            f"{safety_distance['安心寄り'] / total_distance * 100:.1f}%"
+        )
+
+    with c2:
+        st.metric(
+            "🟡 注意",
+            f"{safety_distance['注意'] / total_distance * 100:.1f}%"
+        )
+
+    with c3:
+        st.metric(
+             "🔴 避けたい",
+            f"{safety_distance['避けたい'] / total_distance * 100:.1f}%"
+        )
+
+    with c4:
+        st.metric(
+             "⚪ 不明",
+            f"{safety_distance['不明'] / total_distance * 100:.1f}%"
+        )
+
+# ==============================
+# 地図
+# ==============================
 
 route_coords = [
-
     (
-
-        float(G.nodes[node]["y"]),
-
-        float(G.nodes[node]["x"])
-
+        float(G.nodes[n]["y"]),
+        float(G.nodes[n]["x"])
     )
-
-    for node in route
-
+    for n in route
 ]
 
-center_lat = (
-
-    start_lat + goal_lat
-
-) / 2
-
-center_lon = (
-
-    start_lon + goal_lon
-
-) / 2
+map_center_lat = (start_lat + goal_lat) / 2
+map_center_lon = (start_lon + goal_lon) / 2
 
 m = folium.Map(
-
-    location=[center_lat, center_lon],
-
-    zoom_start=14,
-
-    tiles="OpenStreetMap"
-
-)
-
-# 出発地点
-
-folium.Marker(
-
-    location=[start_lat, start_lon],
-
-    popup=f"出発地：{start_name}",
-
-    tooltip=f"🚩 {start_name}",
-
-    icon=folium.Icon(
-
-        color="green",
-
-        icon="play"
-
+    location=[
+        map_center_lat,
+        map_center_lon
+    ],
+    zoom_start=14
     )
 
-).add_to(m)
-
-# 目的地点
-
-folium.Marker(
-
-    location=[goal_lat, goal_lon],
-
-    popup=f"目的地：{goal_name}",
-
-    tooltip=f"🏁 {goal_name}",
-
-    icon=folium.Icon(
-
-        color="red",
-
-        icon="flag"
-
-    )
-
-).add_to(m)
-
-# ルート
-
+# ルートを表示
 folium.PolyLine(
-
     route_coords,
-
     color=route_color,
-
     weight=7,
-
-    opacity=0.8
-
+    opacity=0.85,
+    tooltip=route_type
 ).add_to(m)
 
-# 地図がルート全体に収まるよう調整
 
-if len(route_coords) > 1:
+# ==============================
+# 出発地
+# ==============================
 
-    m.fit_bounds(route_coords)
+folium.Marker(
+    [start_lat, start_lon],
+    popup=start_name,
+    tooltip=f"出発：{start_name}",
+    icon=folium.Icon(
+        color="blue",
+        icon="play"
+    )
+).add_to(m)
 
-# ==========================================
 
-# 車アニメーション
+# ==============================
+# 目的地
+# ==============================
 
-# ==========================================
+folium.Marker(
+    [goal_lat, goal_lon],
+    popup=goal_name,
+    tooltip=f"目的地：{goal_name}",
+    icon=folium.Icon(
+        color="red",
+        icon="flag"
+   )
+).add_to(m)
 
-drive = st.button(
 
-    "🚗 走行スタート",
+# ==============================
+# 車アイコン
+# ==============================
 
-    type="primary",
+car_marker = folium.Marker(
+    route_coords[0],
+    icon=folium.DivIcon(
+        html="""
+        <div style="
+            font-size:32px;
+            transform:translate(-10px,-18px);
+        ">
+            🚗
+        </div>
+        """
+    )
+).add_to(m)
 
-    use_container_width=True
 
-)
+# ==============================
+# 車を動かす
+# ==============================
 
-if drive:
+route_json = json.dumps(route_coords)
 
-    car_marker = folium.Marker(
+map_name = m.get_name()
+car_name = car_marker.get_name()
 
-        location=route_coords[0],
+animation_script = f"""
+<div style="
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    background: white;
+    padding: 10px 18px;
+    border-radius: 12px;
+    box-shadow: 0px 2px 8px rgba(0,0,0,0.25);
+    text-align:center;
+">
 
-        icon=folium.DivIcon(
+<button
+    id="driveButton"
+    onclick="startDrive()"
+    style="
+        background:#2e8b57;
+        color:white;
+        border:none;
+        padding:10px 24px;
+        border-radius:8px;
+        font-size:16px;
+        cursor:pointer;
+   "
+>
+🚗 ドライブ開始
+</button>
 
-            html="""
+<div
+    id="driveStatus"
+    style="
+        margin-top:6px;
+        font-size:14px;
+        font-weight:bold;
+    "
+>
+ルートを確認して出発！
+</div>
 
-            <div style="
+</div>
 
-                font-size:30px;
 
-                transform:translate(-15px,-15px);
+<script>
 
-            ">
+var driveRoute = {route_json};
 
-                🚗
+var driveIndex = 0;
 
-            </div>
+var driving = false;
 
-            """
 
-        )
+function startDrive() {{
 
-    ).add_to(m)
+    if (driving) {{
+        return;
+    }}
 
-    map_name = m.get_name()
+    driving = true;
+    driveIndex = 0;
 
-    marker_name = car_marker.get_name()
+    document.getElementById("driveButton").disabled = true;
 
-    coordinates_js = [
+    document.getElementById("driveStatus").innerHTML =
+        "🚗 安全運転で出発！";
 
-        [lat, lon]
 
-        for lat, lon in route_coords
+    function moveCar() {{
 
-    ]
+        if (driveIndex < driveRoute.length) {{
 
-    animation_script = f"""
+            var point = driveRoute[driveIndex];
 
-    <script>
+            {car_name}.setLatLng(point);
 
-    setTimeout(function() {{
+            driveIndex++;
 
-        var map = {map_name};
+            setTimeout(moveCar, 120);
 
-        var marker = {marker_name};
+        }} else {{
 
-        var coordinates =
+            document.getElementById("driveStatus").innerHTML =
+                "🎉 目的地に到着しました！";
 
-        {coordinates_js};
+            document.getElementById("driveButton").innerHTML =
+                "🔄 もう一度走る";
 
-        var index = 0;
+            document.getElementById("driveButton").disabled = false;
 
-        function moveCar() {{
-
-            if (index < coordinates.length) {{
-
-                marker.setLatLng(
-
-                    coordinates[index]
-
-                );
-
-                index++;
-
-                setTimeout(
-
-                    moveCar,
-
-                    80
-
-                );
-
-            }}
-
+            driving = false;
         }}
+    }}
 
-        moveCar();
+    moveCar();
+}}
 
-    }}, 500);
+</script>
+"""
 
-    </script>
+m.get_root().html.add_child(
+    folium.Element(animation_script)
+)
 
-    """
 
-    m.get_root().html.add_child(
-
-        folium.Element(
-
-            animation_script
-
-        )
-
-    )
-
-# ==========================================
-
+# ==============================
 # 地図表示
+# ==============================
 
-# ==========================================
-
-map_html = m.get_root().render()
-
-components.html(
-
-    map_html,
-
-    height=600,
-
-    scrolling=False
-
+html(
+    m._repr_html_(),
+    height=650
 )
 
-if drive:
-
-    st.success(
-
-        f"🏁 {goal_name} に到着！"
-
-    )
-
 # ==========================================
-
 # 注意書き
-
 # ==========================================
 
 st.caption(
-
     "※安心度は道路データを前処理・クラスタリングして作成した独自指標です。"
-
     "実際の交通状況や事故リスクを保証するものではありません。"
-
 )
-
-st.caption(
-
-    "道路ネットワーク・地図：© OpenStreetMap contributors ／ "
-
-    "道路データ：国土交通省「国土数値情報」"
-
-)
-
