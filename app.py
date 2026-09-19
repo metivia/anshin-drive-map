@@ -31,7 +31,7 @@ st.write(
 def load_graph():
 
     G = ox.load_graphml(
-        "/content/drive/MyDrive/anshin_drive_graph.graphml"
+        "anshin_drive_graph.graphml"
     )
 
     # GraphML保存後に文字列になった数値をfloatへ戻す
